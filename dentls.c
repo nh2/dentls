@@ -5,6 +5,7 @@
 #include <dirent.h>     /* Defines DT_* constants */
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -65,6 +66,37 @@ struct linux_dirent {
         char           d_type;
 };
 
+struct linked_list_node {
+  void *                    list_node_data_ptr;
+  struct linked_list_node * next;
+};
+
+/* Overrides the first argument to be the new list head. */
+void linked_list_prepend_override(struct linked_list_node ** head_in_out, void * data_ptr) {
+  if (head_in_out == NULL) {
+    fprintf(stderr, "linked_list_prepend_override: head_in_out is NULL\n");
+    exit(1);
+  }
+
+  struct linked_list_node * new_head_ptr = malloc(sizeof(struct linked_list_node));
+  if (!new_head_ptr) {
+    perror("malloc");
+    exit(1);
+  }
+  new_head_ptr->next = *head_in_out;
+  new_head_ptr->list_node_data_ptr = data_ptr;
+  *head_in_out = new_head_ptr;
+}
+
+void free_linked_list(struct linked_list_node * head) {
+  while (head) {
+    free(head->list_node_data_ptr);
+    struct linked_list_node * next = head->next;
+    free(head);
+    head = next;
+  }
+}
+
 int main(const int argc, const char** argv) {
     int totalfiles = 0;
     int dirfd = -1;
@@ -74,6 +106,7 @@ int main(const int argc, const char** argv) {
     char *d_type;
     struct linux_dirent *dent = NULL;
     struct stat dstat;
+    struct linked_list_node * dirent_buffers_list = NULL;
 
     /* Test we have a directory path */
     if (argc < 2) {
@@ -99,11 +132,18 @@ int main(const int argc, const char** argv) {
         exit(1);
     }
 
-    /* Allocate a buffer of equal size to the directory to store dents */
-    if ((buffer = malloc(dstat.st_size+10240)) == NULL) {
+    /* We use the st_size of the directory as a rough estimation of how large
+       getdents() buffers. However, we may still need multiple such buffers,
+       as the actual amount of data returned by getdents() can exceed st_size.
+       See https://serverfault.com/questions/183821/rm-on-a-directory-with-millions-of-files/328305#comment1148905_328305
+    */
+    uint64_t getdents_buf_size = dstat.st_size * 2;
+
+    if ((buffer = malloc(getdents_buf_size)) == NULL) {
         perror("malloc failed");
         exit(1);
     }
+    linked_list_prepend_override(&dirent_buffers_list, buffer);
 
     /* Open the directory */
     if ((dirfd = open(path, O_RDONLY)) < 0) {
@@ -112,9 +152,16 @@ int main(const int argc, const char** argv) {
     }
 
     /* Switch directories */
-    fchdir(dirfd);
+    if (fchdir(dirfd) < 0) {
+      perror("fchdir");
+      exit(1);
+    }
 
-    while (bufcount = syscall(SYS_getdents, dirfd, buffer, dstat.st_size+10240)) {
+    while ((bufcount = syscall(SYS_getdents, dirfd, buffer, getdents_buf_size))) {
+        if (bufcount == -1) {
+            perror("getdents");
+            exit(1);
+        }
         offset = 0;
         dent = buffer;
         while (offset < bufcount) {
@@ -124,7 +171,7 @@ int main(const int argc, const char** argv) {
                 /* Only print files */
                 if (*d_type == DT_REG) {
                     /* Sort all our files into a binary tree */
-            if (!tsearch(dent->d_name, &tree, compare_fnames)) {
+                    if (!tsearch(dent->d_name, &tree, compare_fnames)) {
                       fprintf(stderr, "Cannot acquire resources for tree!\n");
                       exit(1);
                     }
@@ -134,6 +181,13 @@ int main(const int argc, const char** argv) {
             offset += dent->d_reclen;
             dent = buffer + offset;
         }
+
+        // Prepare next buffer
+        if ((buffer = malloc(getdents_buf_size)) == NULL) {
+            perror("malloc failed");
+            exit(1);
+        }
+        linked_list_prepend_override(&dirent_buffers_list, buffer);
     }
     fprintf(stderr, "Total files: %d\n", totalfiles);
     printf("Performing delete..\n");
@@ -141,6 +195,6 @@ int main(const int argc, const char** argv) {
     twalk(tree, walk_tree);
     printf("Done\n");
     close(dirfd);
-    free(buffer);
+    free_linked_list(dirent_buffers_list);
     tdestroy(tree, dummy_destroy);
 }
